@@ -24,13 +24,16 @@ import 'dart:convert' show jsonDecode;
 import 'dart:math' show sqrt;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:openstrap_analytics/onehz.dart' as ana;
+import 'package:package_info_plus/package_info_plus.dart';
 
 import '../../data/day_label.dart';
 import '../../data/db.dart';
 import '../../data/local_repository.dart';
 import '../../l10n/app_localizations.dart';
+import '../../support/support_snapshot.dart';
 import '../ui2.dart';
 import 'day_timeline.dart';
 import 'home_screen.dart';
@@ -226,6 +229,7 @@ class Investigate extends StatefulWidget {
 class _InvestigateState extends State<Investigate> {
   InvestigateData? _d;
   bool _loading = true;
+  bool _copyingSupportSnapshot = false;
   String? _day;
   // A quick second tap on the day stepper starts a second load; the first
   // can finish last and must not paint the old day under the new label.
@@ -265,8 +269,116 @@ class _InvestigateState extends State<Investigate> {
     setState(() {
       _day = day;
       _loading = true;
+      _copyingSupportSnapshot = false;
     });
     _load();
+  }
+
+  bool _supportSnapshotRequestIsCurrent(String day, int token) =>
+      mounted &&
+      token == _loadToken &&
+      !_loading &&
+      _d?.day == day &&
+      (_day ?? _d?.day) == day;
+
+  Future<Map<String, dynamic>> _readSnapshotDay(
+    Future<Map<String, dynamic>> Function(String) read,
+    String day,
+  ) async {
+    try {
+      return await read(day);
+    } catch (_) {
+      // Keep the rest of the allowlisted snapshot useful when one local
+      // projection is unavailable. The collector will label it honestly.
+      return const {};
+    }
+  }
+
+  Future<void> _copySupportSnapshot() async {
+    final data = _d;
+    final day = _day ?? data?.day;
+    if (_loading ||
+        _copyingSupportSnapshot ||
+        data == null ||
+        day == null ||
+        data.day != day) {
+      return;
+    }
+
+    final messenger = ScaffoldMessenger.of(context);
+    final copiedMessage =
+        AppLocalizations.of(context)?.investigateSupportSnapshotCopied ??
+            'Support snapshot copied';
+    final failedMessage =
+        AppLocalizations.of(context)?.investigateSupportSnapshotFailed ??
+            'Could not create support snapshot';
+    final token = _loadToken;
+    setState(() => _copyingSupportSnapshot = true);
+    try {
+      final repo = repoOf(context);
+      if (repo == null) throw StateError('Local repository unavailable');
+
+      // Every repository call is pinned to the captured day. These are stored
+      // projections; this action never invokes derivation or recomputes a day.
+      final projections = await Future.wait<Map<String, dynamic>>([
+        _readSnapshotDay(repo.getDaySleepV2, day),
+        _readSnapshotDay(repo.getDayHrv, day),
+        _readSnapshotDay(repo.getDayHeart, day),
+        _readSnapshotDay(repo.getDayWear, day),
+        _readSnapshotDay(repo.getDayLungs, day),
+      ]);
+      final sleep = projections[0];
+      final hrv = projections[1];
+      final heart = projections[2];
+      final wear = projections[3];
+      final lungs = projections[4];
+
+      Map<String, dynamic>? readinessAbsentDiagnostic;
+      if (heart.containsKey('recovery') && heart['recovery'] == null) {
+        try {
+          readinessAbsentDiagnostic = await LocalDb.readinessAbsentDiag(day);
+        } catch (_) {
+          // The diagnostic is optional; keep copying the other stored data.
+        }
+      }
+
+      PackageInfo? packageInfo;
+      try {
+        packageInfo = await PackageInfo.fromPlatform();
+      } catch (_) {
+        // App metadata is optional on platforms where the plugin is absent.
+      }
+
+      final snapshot = SupportSnapshot.fromStoredData(
+        appVersion: packageInfo?.version,
+        buildNumber: packageInfo?.buildNumber,
+        day: day,
+        algorithmVersion: data.algoVersion,
+        importedFrom: data.importedFrom,
+        deviceFamily: hrv['device_family'],
+        wear: wear,
+        sleep: sleep,
+        hrv: hrv,
+        heart: heart,
+        lungs: lungs,
+        readinessAbsentDiagnostic: readinessAbsentDiagnostic,
+      );
+
+      // Day navigation invalidates the load token. Do not copy an old day if
+      // the user moved while the local projections or PackageInfo were read.
+      if (!_supportSnapshotRequestIsCurrent(day, token)) return;
+      await Clipboard.setData(ClipboardData(text: snapshot.format()));
+      if (!_supportSnapshotRequestIsCurrent(day, token)) return;
+      messenger.showSnackBar(SnackBar(content: Text(copiedMessage)));
+    } catch (_) {
+      if (_supportSnapshotRequestIsCurrent(day, token)) {
+        messenger.showSnackBar(SnackBar(content: Text(failedMessage)));
+      }
+    } finally {
+      if (mounted && token == _loadToken) {
+        setState(() => _copyingSupportSnapshot = false);
+      }
+    }
   }
 
   @override
@@ -307,6 +419,20 @@ class _InvestigateState extends State<Investigate> {
           (l?.investigateAlgoVersionLabel ?? 'Algorithm version',
               d.algoVersion == null ? '—' : 'v${d.algoVersion}'),
         ]),
+        if (d.day != null && d.day == (_day ?? d.day)) ...[
+          const SizedBox(height: S.x3),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              key: const ValueKey('investigate-copy-support-snapshot'),
+              onPressed:
+                  _copyingSupportSnapshot ? null : _copySupportSnapshot,
+              icon: const Icon(Icons.copy_all_outlined),
+              label: Text(l?.investigateCopySupportSnapshot ??
+                  'Copy support snapshot'),
+            ),
+          ),
+        ],
         // The arithmetic is above; this is the other question a person has in
         // front of a number they do not like — what else was going on. Placed
         // here because the day is already resolved and already steerable, so

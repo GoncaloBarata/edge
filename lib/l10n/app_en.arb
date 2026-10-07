@@ -4615,6 +4615,18 @@
   "@investigateWhatHappenedSub": {
     "description": "Link row subtitle describing the day timeline"
   },
+  "investigateCopySupportSnapshot": "Copy support snapshot",
+  "@investigateCopySupportSnapshot": {
+    "description": "Button to copy a privacy-allowlisted snapshot of the selected day"
+  },
+  "investigateSupportSnapshotCopied": "Support snapshot copied",
+  "@investigateSupportSnapshotCopied": {
+    "description": "Confirmation after copying the support snapshot"
+  },
+  "investigateSupportSnapshotFailed": "Could not create support snapshot",
+  "@investigateSupportSnapshotFailed": {
+    "description": "Feedback when the support snapshot could not be collected"
+  },
   "investigateWhichSensorCounted": "Which sensor counted",
   "@investigateWhichSensorCounted": {
     "description": "Table title for step-source breakdown"
