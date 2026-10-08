@@ -26,6 +26,7 @@ import 'home_screen.dart';
 import 'investigate.dart';
 import 'metric_detail.dart';
 import 'naps.dart';
+import 'data_quality_summary.dart';
 
 /// A read this screen can live without. The wear block and the nap block are
 /// ADDITIONS to the repository interface, so an implementation written before
@@ -43,6 +44,18 @@ Future<Map<String, dynamic>> _soft(
     return await read();
   } catch (_) {
     return const {};
+  }
+}
+
+/// An exact-day projection that Vitals can render independently of its peers.
+/// Null means this particular read failed; an empty map means it succeeded but
+/// did not expose the requested field.
+Future<Map<String, dynamic>?> _optionalProjection(
+    Future<Map<String, dynamic>> Function() read) async {
+  try {
+    return await read();
+  } catch (_) {
+    return null;
   }
 }
 
@@ -224,7 +237,7 @@ class HealthData {
 }
 
 class VitalsData {
-  /// The day these four blocks describe. When today has no derived record the
+  /// The day these projections describe. When today has no derived record the
   /// loader falls back to the newest one there is, which is routinely days ago
   /// — and every row was captioned "Today" regardless.
   final String? day;
@@ -232,14 +245,16 @@ class VitalsData {
   /// Every derived day, newest first — what [DayNav] steers over.
   final List<String> days;
 
-  final Map<String, dynamic> timeline, lungs, wear, hrv;
+  final Map<String, dynamic>? timeline, lungs, wear, hrv;
+  final DataQualitySummary? quality;
   const VitalsData({
     this.day,
     this.days = const [],
-    this.timeline = const {},
-    this.lungs = const {},
-    this.wear = const {},
-    this.hrv = const {},
+    this.timeline,
+    this.lungs,
+    this.wear,
+    this.hrv,
+    this.quality,
   });
 
   static Future<VitalsData> load(LocalRepository repo, {String? want}) async {
@@ -248,16 +263,55 @@ class VitalsData {
     final day = pickDay(
         days, want, (today['status'] as Map?)?['today_day']?.toString());
     if (day == null) return VitalsData(days: days);
-    final timeline = await repo.getDayTimeline(day);
+    final timeline = await _optionalProjection(() => repo.getDayTimeline(day));
+    final lungs = await _optionalProjection(() => repo.getDayLungs(day));
+    final wear = await _optionalProjection(() => repo.getDayWear(day));
+    final hrv = await _optionalProjection(() => repo.getDayHrv(day));
+    final sleep = await _optionalProjection(() => repo.getDaySleepV2(day));
+    final heart = await _optionalProjection(() => repo.getDayHeart(day));
+
+    Map<String, dynamic>? readinessAbsentDiagnostic;
+    var readinessDiagnosticAvailable = false;
+    var partialStoredResult = false;
+    try {
+      // A completed dayResult read establishes that metadata is available,
+      // even when there is no row or no readiness diagnostic in its payload.
+      final row = await LocalDb.dayResult(day);
+      readinessDiagnosticAvailable = true;
+      partialStoredResult = row?['partial'] == true || row?['partial'] == 1;
+    } catch (_) {
+      // A failed metadata read makes readiness diagnostic availability unknown.
+    }
+
+    // This helper also swallows its own read and JSON parse failures and returns
+    // null. Those failures cannot be distinguished from an absent diagnostic;
+    // a successful dayResult read therefore maps null to "No value".
+    try {
+      readinessAbsentDiagnostic = await LocalDb.readinessAbsentDiag(day);
+    } catch (_) {
+      readinessAbsentDiagnostic = null;
+    }
+
+    final quality = DataQualitySummary.fromProjections(
+      wear: wear,
+      sleep: sleep,
+      hrv: hrv,
+      lungs: lungs,
+      heart: heart,
+      readinessAbsentDiagnostic: readinessAbsentDiagnostic,
+      readinessDiagnosticAvailable: readinessDiagnosticAvailable,
+      partialFlag: partialStoredResult,
+    );
     return VitalsData(
       // The repository stamps the bundle it actually served; prefer it over the
       // day we asked for, which is what its own comment says to do.
-      day: timeline['date']?.toString() ?? day,
+      day: timeline?['date']?.toString() ?? day,
       days: days,
       timeline: timeline,
-      lungs: await repo.getDayLungs(day),
-      wear: await repo.getDayWear(day),
-      hrv: await repo.getDayHrv(day),
+      lungs: lungs,
+      wear: wear,
+      hrv: hrv,
+      quality: quality,
     );
   }
 }
@@ -556,6 +610,7 @@ class _HealthScreenState extends State<HealthScreen> with RevisionReload {
   /// The day the Vitals tab is showing, once the user has steered off the
   /// default. Null means "whatever the loader resolves", which is today.
   String? _vDay;
+  bool _vLoading = false;
 
   Future<void> _loadVitals({bool force = false}) async {
     final repo = repoOf(context);
@@ -563,11 +618,16 @@ class _HealthScreenState extends State<HealthScreen> with RevisionReload {
     // Keyed per sub-tab: steering to another day starts a read that must beat
     // the one already in flight, and neither may cancel Labs or Explore.
     final t = beginRead(#vitals);
+    setState(() => (_vLoading = true, _vFailed = false));
     try {
       final v = await VitalsData.load(repo, want: _vDay);
-      if (stillNewest(#vitals, t)) setState(() => (_v = v, _vFailed = false));
+      if (stillNewest(#vitals, t)) {
+        setState(() => (_v = v, _vFailed = false, _vLoading = false));
+      }
     } catch (_) {
-      if (stillNewest(#vitals, t)) setState(() => _vFailed = true);
+      if (stillNewest(#vitals, t)) {
+        setState(() => (_vFailed = true, _vLoading = false));
+      }
     }
   }
 
@@ -1128,6 +1188,23 @@ class _HealthScreenState extends State<HealthScreen> with RevisionReload {
             );
     }
 
+    final targetDay = _vDay ?? v.day;
+    if (v.day != targetDay) {
+      return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        ...dayNavRow(targetDay, v.days, _goVitalsDay),
+        if (_vFailed || !_vLoading)
+          _readFailed(l?.healthWhatVitals ?? 'vitals', () {
+            setState(() => _vFailed = false);
+            _loadVitals(force: true);
+          })
+        else
+          const Padding(
+            padding: EdgeInsets.only(top: S.x8),
+            child: Center(child: CircularProgressIndicator()),
+          ),
+      ]);
+    }
+
     // WHICH DAY this tab is showing. Every row here used to say "Today" for a
     // day the loader had fallen back to, which after a sync gap is days ago.
     final behind = _behind(v.day);
@@ -1137,19 +1214,23 @@ class _HealthScreenState extends State<HealthScreen> with RevisionReload {
     // other three rows describe, so it gets its own night when they differ.
     final tempNight = heldOverNightOf(d.today);
 
-    final highs = v.timeline['highs'];
+    final timeline = v.timeline ?? const <String, dynamic>{};
+    final lungs = v.lungs ?? const <String, dynamic>{};
+    final wear = v.wear ?? const <String, dynamic>{};
+    final hrv = v.hrv ?? const <String, dynamic>{};
+    final highs = timeline['highs'];
     num? high(String k) {
       final e = highs is Map ? highs[k] : null;
       return e is Map ? e['v'] as num? : null;
     }
 
     final lo = high('low_hr'), hi = high('peak_hr');
-    final respBlock = v.lungs['resp'];
+    final respBlock = lungs['resp'];
     final resp = respBlock is Map ? respBlock['value'] as num? : null;
-    final worn = v.wear['worn_min'] as num?;
-    final coverage = v.wear['coverage_pct'] as num?;
+    final worn = wear['worn_min'] as num?;
+    final coverage = wear['coverage_pct'] as num?;
     final skinTemp = metricOf(d.today['skin_temp']);
-    final rmssd = v.hrv['rmssd'] as num?;
+    final rmssd = hrv['rmssd'] as num?;
     // MetricRow, not a private copy of it. The one this screen used to grow
     // stacked the value over its qualifier in a shrink-wrapped column, so
     // 'bpm today' and 'SD from your own nights' set each row's width and no
@@ -1197,8 +1278,152 @@ class _HealthScreenState extends State<HealthScreen> with RevisionReload {
             onTap: () => go(c, const MetricDetail('wear'))),
     ];
 
+    final quality = v.quality ?? DataQualitySummary.fromProjections(
+      wear: v.wear,
+      sleep: null,
+      hrv: v.hrv,
+      lungs: v.lungs,
+      heart: null,
+      readinessAbsentDiagnostic: null,
+      readinessDiagnosticAvailable: false,
+    );
+
+    String qualityState(DataQualityState state) => switch (state) {
+          DataQualityState.available =>
+            l?.healthDataQualityAvailable ?? 'Available',
+          DataQualityState.limited => l?.healthDataQualityLimited ?? 'Limited',
+          DataQualityState.withheld =>
+            l?.healthDataQualityWithheld ?? 'Withheld',
+          DataQualityState.absent => l?.healthDataQualityAbsent ?? 'No value',
+          DataQualityState.unavailable =>
+            l?.healthDataQualityUnavailable ?? 'Unavailable',
+        };
+
+    String? sleepSource(DataQualitySleepSource? source) => switch (source) {
+          DataQualitySleepSource.auto =>
+            l?.healthDataQualitySourceAuto ?? 'Auto detected',
+          DataQualitySleepSource.autoFallback =>
+            l?.healthDataQualitySourceAutoFallback ?? 'Auto fallback',
+          DataQualitySleepSource.manual =>
+            l?.healthDataQualitySourceManual ?? 'Manual',
+          DataQualitySleepSource.confirmed =>
+            l?.healthDataQualitySourceConfirmed ?? 'Confirmed',
+          DataQualitySleepSource.none =>
+            l?.healthDataQualitySourceNone ?? 'None',
+          DataQualitySleepSource.rejected =>
+            l?.healthDataQualitySourceRejected ?? 'Rejected',
+          null => null,
+        };
+
+    Widget qualityRow(
+      String metricKey,
+      String title,
+      DataQualityState state,
+      List<String> details,
+    ) => Pressable(
+          key: ValueKey('health-data-quality-$metricKey'),
+          semanticLabel: '$title: ${qualityState(state)}',
+          onTap: () => go(c, Investigate(metricKey, day: targetDay)),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: S.x3),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title, style: F.body.copyWith(color: p.ink)),
+                    if (details.isNotEmpty) ...[
+                      const SizedBox(height: S.x1),
+                      Text(details.join(' · '),
+                          style: F.over.copyWith(color: p.ink3)),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(width: S.x3),
+              Text(qualityState(state),
+                  style: F.over.copyWith(color: p.ink2)),
+            ]),
+          ),
+        );
+
+    final qualityRows = <Widget>[
+      qualityRow(
+        'wear',
+        l?.healthDataQualityWear ?? 'Wear',
+        quality.wear.state,
+        [
+          if (quality.wear.wornMinutes != null)
+            '${quality.wear.wornMinutes!.round()} min',
+          if (quality.wear.coveragePercent != null)
+            '${quality.wear.coveragePercent!.round()}% '
+                '${l?.healthDataQualityCoverage ?? 'coverage'}',
+        ],
+      ),
+      qualityRow(
+        'sleep',
+        l?.healthDataQualitySleep ?? 'Sleep',
+        quality.sleep.state,
+        [
+          ?sleepSource(quality.sleep.source),
+          if (quality.sleep.stageEvidence != null)
+            '${l?.healthDataQualityStageCoverage ?? 'Stage evidence · coverage-derived'}: '
+                '${quality.sleep.stageEvidence!.toStringAsFixed(2)}',
+        ],
+      ),
+      qualityRow('hrv', l?.healthDataQualityHrv ?? 'HRV', quality.hrv.state, [
+        if (quality.hrv.cleanBeats != null && quality.hrv.rrBeats != null)
+          '${quality.hrv.cleanBeats!.round()}/${quality.hrv.rrBeats!.round()} '
+              '${l?.healthDataQualityCleanBeats ?? 'clean beats'}',
+        if (quality.hrv.cleanFraction != null)
+          '${(quality.hrv.cleanFraction! * 100).round()}% '
+              '${l?.healthDataQualityCleanFraction ?? 'clean'}',
+      ]),
+      qualityRow(
+        'resp_rate',
+        l?.healthDataQualityRespiratory ?? 'Respiratory rate',
+        quality.respiratory.state,
+        [
+          if (quality.respiratory.explanation != null)
+            quality.respiratory.explanation!,
+        ],
+      ),
+      qualityRow(
+        'readiness',
+        l?.healthDataQualityReadiness ?? 'Readiness',
+        quality.readiness.state,
+        [
+          if (quality.readiness.explanation != null)
+            quality.readiness.explanation!,
+        ],
+      ),
+    ];
+
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      ...dayNavRow(_vDay ?? v.day, v.days, _goVitalsDay),
+      ...dayNavRow(targetDay, v.days, _goVitalsDay),
+      Section(
+        l?.healthDataQualityTitle ?? 'Data quality',
+        Surface(
+          pad: const EdgeInsets.symmetric(horizontal: S.x4),
+          child: Column(children: [
+            if (quality.partialStoredResult)
+              Padding(
+                padding: const EdgeInsets.only(top: S.x2, bottom: S.x1),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    l?.healthDataQualityPartial ?? 'Partial stored result',
+                    style: F.over.copyWith(color: p.ink3),
+                  ),
+                ),
+              ),
+            for (var i = 0; i < qualityRows.length; i++) ...[
+              if (i > 0) Divider(color: p.line, height: 1),
+              qualityRows[i],
+            ],
+          ]),
+        ),
+      ),
       if (rows.isEmpty)
         StatusCard(
           l?.healthNothingMeasuredDay ?? 'Nothing measured for this day',
